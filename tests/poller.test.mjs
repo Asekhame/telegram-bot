@@ -141,6 +141,6 @@ test("RPC failures are bounded and redact the configured bot token in status", a
   } finally {
     console.error = originalError;
     poller.stop();
-    await rm(directory, { recursive: true, force: true });
+    await rm(directory, { recursive: true, force: true, maxRetries: 5, retryDelay: 20 });
   }
 });
