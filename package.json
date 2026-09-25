@@ -14,8 +14,13 @@
     "start": "node dist/index.js",
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "npm run build && node --test tests/format.test.mjs tests/allowlist.test.mjs",
     "test": "npm run build && node --test tests/*.test.mjs",
-    "scan": "tsx src/stellar/events.ts"
+    "test:mock": "npm run build && node --test tests/mock-*.test.mjs",
+    "scan": "tsx src/stellar/events.ts",
+    "scan:mock": "tsx src/stellar/events.ts --mock",
+    "mock:rpc": "tsx src/stellar/mock-rpc.ts",
+    "mock:poll": "tsx src/mock-run.ts"
   },
   "dependencies": {
     "@stellar/stellar-sdk": "^16.2.0",

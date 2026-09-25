@@ -81,9 +81,14 @@ export interface RawScan {
  * discover the cursor stopped moving.
  */
 export function eventCursorLedger(cursor: string): number | null {
+  if (typeof cursor !== "string") return null;
   const toid = cursor.split("-")[0];
   if (!toid || !/^\d+$/.test(toid)) return null;
-  return Number(BigInt(toid) >> 32n);
+  try {
+    return Number(BigInt(toid) >> 32n);
+  } catch {
+    return null;
+  }
 }
 
 export async function paginatedGetEvents(
@@ -125,8 +130,9 @@ export async function paginatedGetEvents(
           limit,
         });
 
-    events.push(...response.events);
-    latestLedger = response.latestLedger;
+    const rawEvents = Array.isArray(response?.events) ? response.events : [];
+    events.push(...rawEvents);
+    latestLedger = response?.latestLedger ?? latestLedger;
 
     const nextCursor = response.cursor || "";
     // Out of cursor, or the server stopped moving: nothing left to read.
@@ -194,9 +200,12 @@ export async function readContractEvents(
 //   npm run scan -- --pages 40    # walk further
 //   npm run scan -- --show 5      # print 5 decoded events per contract
 //   npm run scan -- --from 123456 # explicit start ledger
+//   npm run scan -- --mock        # local mock profile: no network, no credentials
 //
 // Needs no BOT_TOKEN: the public Testnet RPC is unauthenticated, so this reads
-// live chain data with nothing but the contract ids.
+// live chain data with nothing but the contract ids. `--mock` instead points
+// the same reader at a local mock Soroban RPC (`npm run mock:rpc`), selecting
+// the `MIMIR_PROFILE=mock` defaults for anything the environment leaves unset.
 
 function flag(name: string): string | undefined {
   const index = process.argv.indexOf(`--${name}`);
@@ -233,7 +242,21 @@ function summarize(event: DecodedEvent): string {
   }
 }
 
+function boundedJson(value: unknown): string {
+  return JSON.stringify(value, (_key, item) => {
+    if (typeof item !== "string") return typeof item === "bigint" ? item.toString() : item;
+    const compact = item.replace(/\s+/g, " ").trim();
+    return compact.length <= 240 ? compact : `${compact.slice(0, 239)}…`;
+  });
+}
+
 async function main(): Promise<void> {
+  // `--mock` opts into the local mock profile before config is read. An
+  // explicit MIMIR_PROFILE in the environment still wins; blank counts as unset.
+  if (process.argv.includes("--mock") && !process.env.MIMIR_PROFILE?.trim()) {
+    process.env.MIMIR_PROFILE = "mock";
+  }
+
   const config = loadStellarConfig();
   const server = createRpcServer(config);
   const pages = Number(flag("pages") ?? EVENT_MAX_PAGES);
@@ -277,7 +300,7 @@ async function main(): Promise<void> {
       console.log(`\n  ledger ${event.ledger}  tx ${event.txHash}`);
       console.log(`  ${summarize(event)}`);
       console.log(
-        `  ${JSON.stringify(event.payload, (_k, v) => (typeof v === "bigint" ? v.toString() : v))}`,
+        `  ${boundedJson(event.payload)}`,
       );
     }
   }

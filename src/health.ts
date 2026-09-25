@@ -39,6 +39,7 @@ export interface HealthReport {
     running: boolean;
     /** Intentional operator pause; process is ready but scheduling is stopped. */
     paused: boolean;
+    channelPreviewMode: boolean;
     cycles: number;
     lastPollAt: string | null;
     lastSuccessAt: string | null;
@@ -116,6 +117,7 @@ export function buildHealthReport(
     poller: {
       running: poller.running,
       paused: poller.paused === true,
+      channelPreviewMode: config.channelPreviewMode === true,
       cycles: poller.cycles,
       lastPollAt: iso(poller.lastPollAt),
       lastSuccessAt: iso(poller.lastSuccessAt),

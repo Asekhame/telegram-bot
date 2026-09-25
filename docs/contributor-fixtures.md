@@ -16,7 +16,8 @@ npm test
 ```
 
 `npm test` builds `src/` → `dist/`, then runs every `tests/*.test.mjs` file with
-Node's built-in test runner (the same path CI uses).
+Node's built-in test runner (the same path CI uses). To run only the local-mock
+suites: `npm run test:mock`.
 
 Live Testnet scanning is **manual and separate**:
 
@@ -37,6 +38,9 @@ Do not wire `npm run scan` into automated tests.
 | `tests/format.test.mjs` | Inline event-formatting units (MarkdownV2, USDC, Telegram send failures) |
 | `tests/bot.test.mjs` | Mocked grammy operator-command routing and exact reply payloads |
 | `tests/poller.test.mjs` | Pause/resume boundaries, restart cursor compatibility, RPC failure redaction |
+| `tests/soak.test.mjs` | Long-run memory/timer/log boundedness under scripted RPC and Telegram failures (mock timers, forced GC, leak control) |
+| `tests/mock-rpc.test.mjs` | Live mock RPC: scanner walks, poller failure drills, cursor safety, log bounds |
+| `tests/mock-profile.test.mjs` | `MIMIR_PROFILE=mock` defaults, explicit-env precedence, unknown-profile failure |
 
 ## Event fixture schema
 
@@ -110,11 +114,33 @@ When you add persistence tests:
 | Failure | Cursor | Notification | Fixture tip |
 | --- | --- | --- | --- |
 | RPC error for one contract | **unchanged** for that target | none that cycle | Fake rejected `readContractEvents`; assert cursor string identical |
-| Telegram send error | **still advances** | counted as failed | Fake `sendMessage` reject; assert no token in the Error message |
+| Telegram send error | **commits after partial delivery** | counted as failed | Fake `sendMessage` reject; assert cursor advances and no token appears in the Error message |
 | Corrupt cursor file | cold start | n/a | Use `cursor-corrupt.txt` contents |
 | Burst over cap | advances | extras skipped | Cap `MAX_NOTIFICATIONS_PER_CYCLE` in the fake config |
 | Unauthorized `/pause` or `/resume` | untouched | no command reply | Mock grammy with a different Telegram user id |
 | Operator pause → restart | version-1 cursor unchanged | no replay | Reload a valid cursor fixture; pause must not persist |
+
+## Failure drills against the local mock
+
+The table above is enforced against fakes in unit tests **and** against a real
+HTTP server: `src/stellar/mock-rpc.ts` implements the Soroban JSON-RPC surface
+(cursor pagination, empty pages, retained floor, mutual exclusion) plus
+injected failures, so the same expectations can be rehearsed end to end with
+the `MIMIR_PROFILE=mock` profile — loopback only, no credentials, isolated
+`data/cursor.mock.json`:
+
+```bash
+npm run mock:rpc -- --fail-events error   # every scan fails until the process restarts
+npm run mock:poll -- --stale-cursor       # cursors rejected once the poller has one
+npm run mock:poll -- --malformed          # undecodable event must skip, not crash
+npm run scan:mock                         # scanner --mock against a running mock:rpc
+```
+
+`tests/mock-rpc.test.mjs` drives the real `createPoller` against
+`startMockRpc()` on an ephemeral port and asserts the failure-mode table above:
+cursor unchanged across RPC failures and stale-cursor rejections, cursor
+advancing past Telegram failures, skipped events, and cap drops, restart
+without replay, bounded redacted logs, and the version-1 cursor file shape.
 
 ## Adding a new fixture case
 

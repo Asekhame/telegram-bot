@@ -10,9 +10,21 @@ Operational guidance for recovering the Mimir Telegram notifier from missed noti
 * Cursors must only move according to the poller's existing persistence rules.
 * Logs and status output must not expose bot tokens, private keys, payment proofs, or unbounded remote payloads.
 
+Notification text from contract String fields is bounded to 200 Unicode code
+points before MarkdownV2 escaping. An oversized or malformed transaction hash
+does not receive an explorer link. The original event is still decoded and the
+cursor follows the normal poller rules; truncation affects only the Telegram
+presentation, not chain data or persisted cursor state.
+
 ## Quick health check
 
 Run:
+
+```bash
+/health
+```
+
+Or for full poller state details:
 
 ```bash
 /status
@@ -20,13 +32,14 @@ Run:
 
 Check:
 
+* overall readiness and status (`ok`, `degraded`, `stopped`)
 * current chain tip
 * RPC retained-history floor
 * watched contract IDs
 * last event ledger per contract
 * persisted cursor
 * poll/send counters
-* last error
+* last error and consecutive failure count
 
 For a read-only chain diagnostic without a Telegram token:
 
@@ -87,7 +100,11 @@ Do not manually advance the cursor to skip an RPC failure.
 3. Use `/status` to confirm the process is still running and not intentionally paused.
 4. Restart only when configuration has been corrected. If polling was deliberately paused, use `/resume` after the token/chat is healthy.
 
-Telegram delivery is intentionally lossy. A failed send does not hold the cursor back because replaying every missed notification could create an unbounded backlog or flood a recovered chat.
+Telegram delivery is intentionally lossy. The poller commits the opaque cursor
+after processing the returned page, even when sends are partial. A failed send
+does not hold the cursor back because replaying every missed notification could
+create an unbounded backlog or flood a recovered chat. The log reports the
+sent/failed/skipped counts for that commit.
 
 The Stellar chain remains the authoritative record.
 
@@ -151,6 +168,12 @@ Do not manually replay large event ranges into Telegram.
 
 A malformed event must not crash the long-running process.
 
+`decodeEvent` converts malformed XDR and events introduced by a newer contract
+deployment into a bounded `unknown` record. The poller logs only the contract,
+event name, ledger, and a clipped reason, skips Telegram delivery for that
+event, and continues with the RPC cursor returned by the scan. This protects
+the long-running reader while preserving the chain as the source of truth.
+
 When investigating:
 
 1. Use `npm run scan` to inspect the affected event range.
@@ -202,6 +225,25 @@ Never log:
 * sensitive authentication data
 
 When reporting an incident, include only the minimum information needed to identify the failure, such as contract, ledger, cursor state, error category, and timestamp.
+
+## Rehearsing locally (mock profile)
+
+Every failure mode in this runbook can be drilled on a laptop against the
+local mock profile — loopback only, no bot token, no Testnet, and an isolated
+`data/cursor.mock.json` that never overlaps a real bot's cursor:
+
+```bash
+npm run mock:poll -- --fail-events error   # RPC failure drill (see "RPC failures")
+npm run mock:poll -- --stale-cursor        # stale cursor drill (see "Stale or corrupt cursor")
+npm run mock:poll -- --malformed           # undecodable event drill
+npm run mock:poll                          # healthy dry run; sends are logged, not delivered
+curl -s http://127.0.0.1:8787/health | jq .status
+```
+
+Injected failures last until the process stops, so recovery is "restart without
+the flag": the cursor must resume exactly where it was, log lines stay bounded,
+and no token-shaped secret appears anywhere in the output. The same guarantees
+are asserted by `tests/mock-rpc.test.mjs` (`npm run test:mock`).
 
 ## Verification
 

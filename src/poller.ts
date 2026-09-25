@@ -7,11 +7,12 @@
  *
  *  - A failed RPC call fails ONE contract's scan for ONE cycle. Its cursor is
  *    left untouched, so the next cycle picks up exactly where it stopped.
- *  - A failed Telegram send drops ONE message. The cursor still advances.
- *    That is deliberate: holding the cursor back on a send failure means a
- *    broken bot token or a chat the bot was kicked from turns into an infinite
- *    replay of the same events forever, and recovering floods the channel.
- *    Notifications are lossy by design; the chain remains the record.
+ *  - A scan cursor is committed after its returned page has been processed,
+ *    even when delivery was partial. Unknown events, the per-cycle cap, and
+ *    exhausted Telegram retries are deliberate drops. Holding the cursor back
+ *    would turn a broken token or chat into an infinite replay, and recovery
+ *    would flood the channel. Notifications are lossy by design; the chain
+ *    remains the record.
  *  - A cursor file that cannot be read is treated as a cold start; one that
  *    cannot be written is logged, and the in-memory cursor keeps working until
  *    the next restart.
@@ -61,6 +62,51 @@ interface CursorFile {
   version: 1;
   updatedAt: string;
   targets: Record<string, { cursor: string | null; lastEventLedger: number | null }>;
+}
+
+interface CursorTarget {
+  cursor: string | null;
+  lastEventLedger: number | null;
+}
+
+function parseCursorFile(raw: string): CursorFile {
+  const parsed: unknown = JSON.parse(raw);
+  if (typeof parsed !== "object" || parsed === null) {
+    throw new Error("cursor root must be an object");
+  }
+
+  const candidate = parsed as Partial<CursorFile>;
+  if (candidate.version !== 1 || typeof candidate.targets !== "object" || candidate.targets === null) {
+    throw new Error("unsupported cursor format; expected version 1");
+  }
+
+  const targets: Record<string, CursorTarget> = {};
+  for (const [source, value] of Object.entries(candidate.targets)) {
+    if (typeof value !== "object" || value === null) {
+      throw new Error(`invalid cursor target ${source}`);
+    }
+    const target = value as Partial<CursorTarget>;
+    if (
+      target.cursor !== null &&
+      (typeof target.cursor !== "string" || target.cursor.length === 0 || target.cursor.length > 256)
+    ) {
+      throw new Error(`invalid cursor value for ${source}`);
+    }
+    if (
+      target.lastEventLedger !== null &&
+      (typeof target.lastEventLedger !== "number" ||
+        !Number.isSafeInteger(target.lastEventLedger) ||
+        target.lastEventLedger < 0)
+    ) {
+      throw new Error(`invalid last event ledger for ${source}`);
+    }
+    targets[source] = {
+      cursor: target.cursor ?? null,
+      lastEventLedger: target.lastEventLedger ?? null,
+    };
+  }
+
+  return { version: 1, updatedAt: String(candidate.updatedAt ?? ""), targets };
 }
 
 export interface PollerDeps {
@@ -183,7 +229,7 @@ export function createPoller(deps: PollerDeps) {
     }
 
     try {
-      const parsed = JSON.parse(raw) as CursorFile;
+      const parsed = parseCursorFile(raw);
       for (const [source, saved] of Object.entries(parsed.targets ?? {})) {
         const target = state.get(source as ContractSource);
         if (!target) continue;
@@ -228,12 +274,21 @@ export function createPoller(deps: PollerDeps) {
 
   // ── One cycle ──────────────────────────────────────────────────────────────
 
-  async function notify(events: DecodedEvent[]): Promise<void> {
+  interface NotificationResult {
+    sent: number;
+    failed: number;
+    skipped: number;
+  }
+
+  async function notify(events: DecodedEvent[]): Promise<NotificationResult> {
     let sentThisCycle = 0;
+    let failed = 0;
+    let skipped = 0;
 
     for (const event of events) {
       if (event.payload.name === "unknown") {
         status.eventsSkipped += 1;
+        skipped += 1;
         console.log(
           `[poller] skipped ${event.source} event "${boundedLabel(event.payload.eventName, 80)}" ` +
             `at ledger ${event.ledger}` +
@@ -247,11 +302,13 @@ export function createPoller(deps: PollerDeps) {
       const text = formatEvent(config, event);
       if (text === null) {
         status.eventsSkipped += 1;
+        skipped += 1;
         continue;
       }
 
       if (sentThisCycle >= config.maxNotificationsPerCycle) {
         status.eventsSkipped += 1;
+        skipped += 1;
         console.warn(
           `[poller] cycle notification cap (${config.maxNotificationsPerCycle}) reached; ` +
             `dropping ${event.payload.name} at ledger ${event.ledger}`,
@@ -267,6 +324,7 @@ export function createPoller(deps: PollerDeps) {
       } catch (err) {
         // All retries exhausted; drop the message but continue processing others.
         status.notificationsFailed += 1;
+        failed += 1;
         console.error(
           `[poller] send failed for ${event.payload.name} at ledger ${event.ledger} after retries: ` +
             errorMessage(err),
@@ -275,6 +333,8 @@ export function createPoller(deps: PollerDeps) {
 
       if (sentThisCycle < config.maxNotificationsPerCycle) await sleep(SEND_SPACING_MS);
     }
+
+    return { sent: sentThisCycle, failed, skipped };
   }
 
   async function cycle(): Promise<void> {
@@ -300,17 +360,28 @@ export function createPoller(deps: PollerDeps) {
         current.lastError = null;
         anyOk = true;
 
+        let delivery: NotificationResult = { sent: 0, failed: 0, skipped: 0 };
         if (scan.events.length > 0) {
           console.log(
             `[poller] ${target.source}: ${scan.events.length} event(s) ` +
               `up to ledger ${scan.lastEventLedger} in ${scan.pages} page(s)`,
           );
-          await notify(scan.events);
+          delivery = await notify(scan.events);
         }
 
         if (scan.lastEventLedger !== null) current.lastEventLedger = scan.lastEventLedger;
-        // Advance last — see the failure policy at the top of this file.
-        if (scan.cursor) current.cursor = scan.cursor;
+        // The opaque cursor covers the whole returned page, so it cannot be
+        // committed per event. Commit after processing the page, including
+        // deliberate drops, to avoid replaying a permanent Telegram failure.
+        if (scan.cursor) {
+          current.cursor = scan.cursor;
+          if (delivery.failed > 0 || delivery.skipped > 0) {
+            console.warn(
+              `[poller] ${target.source}: committed cursor after partial delivery ` +
+                `(sent=${delivery.sent}, failed=${delivery.failed}, skipped=${delivery.skipped})`,
+            );
+          }
+        }
       } catch (err) {
         const message = errorMessage(err);
         current.lastError = message;

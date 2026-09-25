@@ -178,3 +178,39 @@ test("safeErrorMessage redacts Telegram-shaped tokens and clips remote payloads"
   assert.equal(message.length, 240);
   assert.match(message, /^\[REDACTED] \[REDACTED] remote-payload/);
 });
+
+test("/preview command sends exact MarkdownV2 preview payload for market and squad", async () => {
+  const { handlers } = mockedBot({
+    config: baseConfig(),
+    status: () => baseStatus(),
+    pause: () => "paused",
+    resume: () => "resumed",
+  });
+
+  let marketReplied = false;
+  const ctxMarket = {
+    message: { text: "/preview market" },
+    update: { update_id: 101 },
+    reply: async (...args) => {
+      marketReplied = true;
+      assert.match(args[0], /🧪 \*Channel Preview — mimir\\-market\*/);
+      assert.deepEqual(args[1], TELEGRAM_OPTIONS);
+    },
+  };
+  await handlers.get("preview")(ctxMarket);
+  assert.equal(marketReplied, true);
+
+  let squadReplied = false;
+  const ctxSquad = {
+    message: { text: "/preview squad" },
+    update: { update_id: 102 },
+    reply: async (...args) => {
+      squadReplied = true;
+      assert.match(args[0], /🧪 \*Channel Preview — mimir\\-squad\*/);
+      assert.deepEqual(args[1], TELEGRAM_OPTIONS);
+    },
+  };
+  await handlers.get("preview")(ctxSquad);
+  assert.equal(squadReplied, true);
+});
+
