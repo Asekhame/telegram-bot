@@ -198,7 +198,10 @@ test("soak: heap, status and logs stay bounded across failures and malformed eve
     assert.ok(target.cursor === null || target.cursor.length <= 128);
   }
 
-  // The stale-cursor / outage cycles never rewound the market cursor.
+  // The scripted stale rejections land on a cursor that is inside the retained
+  // window, so they must never trigger a floor rewind: the market cursor is
+  // kept and the rewind counter stays at zero.
+  assert.equal(status.cursorRewinds, 0, "an in-window stale rejection must not rewind");
   assert.notEqual(status.targets.find((t) => t.source === "market").cursor, null);
 
   // Logs: plenty of them, but every line bounded and token-free.
@@ -230,7 +233,13 @@ test("soak: real timers, one scheduled poll at most, none after stop()", { timeo
       throw new Error(`RPC down ${TOKEN}`);
     },
   };
-  const poller = createPoller({ config, server: failingServer, send: async () => undefined });
+  const poller = createPoller({
+    config,
+    server: failingServer,
+    send: async () => undefined,
+    // This test measures timer hygiene under sustained failure; keep the breaker from pausing RPC calls.
+    circuitBreakerOptions: { failureThreshold: Number.POSITIVE_INFINITY },
+  });
   const timeouts = () => process.getActiveResourcesInfo().filter((r) => r === "Timeout").length;
   const baseline = timeouts();
   let peak = 0;

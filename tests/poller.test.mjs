@@ -28,8 +28,26 @@
  */
 
 import assert from "node:assert/strict";
+import { existsSync } from "node:fs";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 import test from "node:test";
 import { createPoller } from "../dist/poller.js";
+import { createTempDataDir } from "./helpers/temp-data.mjs";
+
+// Ephemeral data directory: no test touches the repo data/ dir or fixed /tmp names.
+const dataDir = await createTempDataDir("mimir-poller-");
+test.after(() => dataDir.cleanup());
+
+/** Polls `cond` until true or `timeoutMs` elapses (then fails the test). */
+async function waitFor(cond, timeoutMs = 2_000) {
+  const deadline = Date.now() + timeoutMs;
+  while (!cond()) {
+    if (Date.now() > deadline) throw new Error("waitFor timed out");
+    await new Promise((r) => setTimeout(r, 5));
+  }
+}
 
 // ── Fake builder helpers ──────────────────────────────────────────────────────
 
@@ -53,7 +71,7 @@ function baseConfig(overrides = {}) {
     networkPassphrase: "Test SDF Network ; September 2015",
     pollIntervalMs: 100_000, // large: we call cycle() manually
     startLookbackLedgers: 60,
-    cursorFile: "/tmp/test-cursor-not-real.json",
+    cursorFile: dataDir.file("unused-cursor.json"),
     maxNotificationsPerCycle: 5,
     ...overrides,
   };
@@ -189,7 +207,7 @@ test("poller: after a successful scan, cursor is updated in status", async () =>
   };
 
   // We need to intercept cursor writes; use a temporary path that won't exist
-  const tmpCursorPath = `/tmp/poller-test-cursor-${Date.now()}.json`;
+  const tmpCursorPath = dataDir.file("poller-test-cursor.json");
   const config = baseConfig({ cursorFile: tmpCursorPath });
 
   const poller = createPoller({ config, server, send: async () => {} });
@@ -216,32 +234,21 @@ test("poller: after a successful scan, cursor is updated in status", async () =>
 // ── Cursor persistence (corrupt file) ────────────────────────────────────────
 
 test("poller: corrupt cursor file triggers cold start, does not throw", async () => {
-  // Write a corrupt cursor file, start the poller, verify it recovers gracefully.
-  import("node:fs/promises").then(async ({ writeFile, unlink }) => {
-    const tmpPath = `/tmp/corrupt-cursor-${Date.now()}.json`;
-    await writeFile(tmpPath, "{ this is not valid json }", "utf8");
+  const cursorFile = dataDir.file("corrupt-cursor.json");
+  await writeFile(cursorFile, "{ this is not valid json }", "utf8");
 
-    const config = baseConfig({ cursorFile: tmpPath, pollIntervalMs: 9_999_999 });
-    const server = makeFakeServer({ status: "healthy", oldestLedger: 4000, latestLedger: 5000 });
+  const config = baseConfig({ cursorFile, pollIntervalMs: 9_999_999 });
+  const server = makeFakeServer({ status: "healthy", oldestLedger: 4000, latestLedger: 5000 });
+  const poller = createPoller({ config, server, send: async () => {} });
 
-    let threw = false;
-    try {
-      const poller = createPoller({ config, server, send: async () => {} });
-      await poller.start();
-      await new Promise((r) => setTimeout(r, 20));
-      poller.stop();
-    } catch {
-      threw = true;
-    }
-
-    assert.equal(threw, false, "corrupt cursor file must not cause start() to throw");
-    await unlink(tmpPath).catch(() => {});
-  });
+  await poller.start(); // must not reject
+  poller.stop();
+  for (const t of poller.status().targets) assert.equal(t.cursor, null);
 });
 
 test("poller: corrupt cursor JSON results in cold start (cursors remain null after loadCursors)", async () => {
   const { writeFile, unlink } = await import("node:fs/promises");
-  const tmpPath = `/tmp/corrupt-cursor-2-${Date.now()}.json`;
+  const tmpPath = dataDir.file("corrupt-cursor-2.json");
   await writeFile(tmpPath, "<<<not json>>>", "utf8");
 
   const config = baseConfig({ cursorFile: tmpPath, pollIntervalMs: 9_999_999 });
@@ -275,7 +282,7 @@ test("poller: corrupt cursor JSON results in cold start (cursors remain null aft
 
 test("poller: missing cursor file results in cold start, not an error", async () => {
   const config = baseConfig({
-    cursorFile: `/tmp/definitely-does-not-exist-${Date.now()}.json`,
+    cursorFile: dataDir.file("definitely-does-not-exist.json"),
     pollIntervalMs: 9_999_999,
   });
   const server = {
@@ -320,7 +327,7 @@ test("poller: RPC failure for one target does not prevent the other from scannin
     },
   };
 
-  const config = baseConfig({ cursorFile: `/tmp/rpc-fail-${Date.now()}.json`, pollIntervalMs: 9_999_999 });
+  const config = baseConfig({ cursorFile: dataDir.file("rpc-fail.json"), pollIntervalMs: 9_999_999 });
   const sent = [];
   const poller = createPoller({ config, server, send: async (msg) => { sent.push(msg); } });
 
@@ -347,7 +354,7 @@ test("poller: consecutiveFailures increments when ALL targets fail", async () =>
     },
   };
 
-  const config = baseConfig({ cursorFile: `/tmp/all-fail-${Date.now()}.json`, pollIntervalMs: 9_999_999 });
+  const config = baseConfig({ cursorFile: dataDir.file("all-fail.json"), pollIntervalMs: 9_999_999 });
   const poller = createPoller({ config, server, send: async () => {} });
 
   await poller.start();
@@ -377,7 +384,7 @@ test("poller: consecutiveFailures resets when any target succeeds", async () => 
   };
 
   // Use a fast interval so two cycles can complete quickly
-  const config = baseConfig({ cursorFile: `/tmp/reset-failures-${Date.now()}.json`, pollIntervalMs: 30 });
+  const config = baseConfig({ cursorFile: dataDir.file("reset-failures.json"), pollIntervalMs: 30 });
   const poller = createPoller({ config, server, send: async () => {} });
 
   await poller.start();
@@ -401,7 +408,7 @@ test("poller: getHealth failure propagates to target error and increments consec
     },
   };
 
-  const config = baseConfig({ cursorFile: `/tmp/health-fail-${Date.now()}.json`, pollIntervalMs: 9_999_999 });
+  const config = baseConfig({ cursorFile: dataDir.file("health-fail.json"), pollIntervalMs: 9_999_999 });
   const poller = createPoller({ config, server, send: async () => {} });
 
   await poller.start();
@@ -448,7 +455,7 @@ test("poller: Telegram send rejection increments notificationsFailed but does no
     },
   };
 
-  const config = baseConfig({ cursorFile: `/tmp/tg-fail-${Date.now()}.json`, pollIntervalMs: 9_999_999 });
+  const config = baseConfig({ cursorFile: dataDir.file("tg-fail.json"), pollIntervalMs: 9_999_999 });
   const poller = createPoller({ config, server, send: async () => Promise.reject(sendError) });
 
   await poller.start();
@@ -508,7 +515,7 @@ test("poller: send failure does not prevent cursor from advancing", async () => 
   };
 
   const sendAttempts = [];
-  const config = baseConfig({ cursorFile: `/tmp/cursor-advance-${Date.now()}.json`, pollIntervalMs: 9_999_999 });
+  const config = baseConfig({ cursorFile: dataDir.file("cursor-advance.json"), pollIntervalMs: 9_999_999 });
   const poller = createPoller({
     config,
     server,
@@ -521,8 +528,8 @@ test("poller: send failure does not prevent cursor from advancing", async () => 
   await poller.start();
   // The poller's notify() sleeps SEND_SPACING_MS (1500ms) between messages.
   // A failed send still triggers the spacing because sentThisCycle stays 0.
-  // sendWithRetry (#166) makes 3 attempts with 1s + 2s backoff before the send counts as failed, then spacing and the cursor write follow.
-  await new Promise((r) => setTimeout(r, 5500));
+  // Wait long enough for the full cycle (send attempt + spacing + cursor write).
+  await waitFor(() => poller.status().notificationsFailed >= 1 && poller.status().targets.find((t) => t.source === "market").cursor !== null, 20_000);
   poller.stop();
 
   const st = poller.status();
@@ -575,7 +582,7 @@ test("poller: maxNotificationsPerCycle cap — events beyond cap are skipped", a
 
   const sent = [];
   const config = baseConfig({
-    cursorFile: `/tmp/cap-${Date.now()}.json`,
+    cursorFile: dataDir.file("cap.json"),
     pollIntervalMs: 9_999_999,
     maxNotificationsPerCycle: 3,
   });
@@ -586,10 +593,9 @@ test("poller: maxNotificationsPerCycle cap — events beyond cap are skipped", a
   });
 
   await poller.start();
-  // Cap is 3 but each send has a 1500ms spacing — too slow to wait for.
-  // Instead we just confirm the cap variable is respected by checking status
-  // without waiting for all sends.
-  await new Promise((r) => setTimeout(r, 80));
+  // Each send is spaced 1500ms apart, so wait for the cycle to finish (its cursor
+  // save is the last step) rather than leaving it writing into a removed data dir.
+  await waitFor(() => poller.status().targets.every((t) => t.cursor !== null), 20_000);
   poller.stop();
 
   const st = poller.status();
@@ -617,7 +623,7 @@ test("poller: stop() prevents further cycles after the current one completes", a
   };
 
   // Short poll interval so the timer would fire quickly if stop() didn't work.
-  const config = baseConfig({ cursorFile: `/tmp/stop-${Date.now()}.json`, pollIntervalMs: 20 });
+  const config = baseConfig({ cursorFile: dataDir.file("stop.json"), pollIntervalMs: 20 });
   const poller = createPoller({ config, server, send: async () => {} });
 
   await poller.start();
@@ -633,7 +639,7 @@ test("poller: stop() prevents further cycles after the current one completes", a
 });
 
 test("poller: status().running is false after stop()", async () => {
-  const config = baseConfig({ cursorFile: `/tmp/running-${Date.now()}.json`, pollIntervalMs: 9_999_999 });
+  const config = baseConfig({ cursorFile: dataDir.file("running.json"), pollIntervalMs: 9_999_999 });
   const server = {
     async getHealth() {
       return { status: "healthy", oldestLedger: 4000, latestLedger: 5000 };
@@ -651,7 +657,7 @@ test("poller: status().running is false after stop()", async () => {
 
 test("poller: start() sets startedAt and increments cycles on first poll", async () => {
   const tip = 5000;
-  const config = baseConfig({ cursorFile: `/tmp/startedat-${Date.now()}.json`, pollIntervalMs: 9_999_999 });
+  const config = baseConfig({ cursorFile: dataDir.file("startedat.json"), pollIntervalMs: 9_999_999 });
   const server = {
     async getHealth() {
       return { status: "healthy", oldestLedger: 4000, latestLedger: tip };
@@ -691,7 +697,7 @@ test("poller: failed market scan does not update market cursor but squad cursor 
     },
   };
 
-  const config = baseConfig({ cursorFile: `/tmp/iso-${Date.now()}.json`, pollIntervalMs: 9_999_999 });
+  const config = baseConfig({ cursorFile: dataDir.file("iso.json"), pollIntervalMs: 9_999_999 });
   const poller = createPoller({ config, server, send: async () => {} });
 
   await poller.start();
@@ -710,7 +716,7 @@ test("poller: failed market scan does not update market cursor but squad cursor 
 // ── Poller status shape ───────────────────────────────────────────────────────
 
 test("poller: status() returns a snapshot, not a live reference", async () => {
-  const config = baseConfig({ cursorFile: `/tmp/snapshot-${Date.now()}.json`, pollIntervalMs: 9_999_999 });
+  const config = baseConfig({ cursorFile: dataDir.file("snapshot.json"), pollIntervalMs: 9_999_999 });
   const server = {
     async getHealth() {
       return { status: "healthy", oldestLedger: 4000, latestLedger: 5000 };
@@ -734,7 +740,7 @@ test("poller: status() returns a snapshot, not a live reference", async () => {
 });
 
 test("poller: targets list has exactly two entries (market and squad)", async () => {
-  const config = baseConfig({ cursorFile: `/tmp/targets-${Date.now()}.json`, pollIntervalMs: 9_999_999 });
+  const config = baseConfig({ cursorFile: dataDir.file("targets.json"), pollIntervalMs: 9_999_999 });
   const server = {
     async getHealth() {
       return { status: "healthy", oldestLedger: 4000, latestLedger: 5000 };
@@ -753,4 +759,317 @@ test("poller: targets list has exactly two entries (market and squad)", async ()
   assert.equal(st.targets.length, 2);
   const sources = st.targets.map((t) => t.source).sort();
   assert.deepEqual(sources, ["market", "squad"]);
+});
+
+// ── Graceful shutdown ─────────────────────────────────────────────────────────
+//
+// Positive: a cursor the cycle advanced in memory is flushed before the
+// process gives up on that cycle. Negative: the rest of an in-flight burst is
+// dropped rather than replayed. Boundary: the drain budget is a deadline, not
+// a suggestion, and a cycle that never finishes cannot clobber the file.
+// Restart: the flushed file is what the next process resumes from.
+// Regression: `stop()` keeps its old immediate, non-flushing semantics.
+
+const SHUT_TIP = 4_226_691;
+/** Cursor the fake chain serves after a successful scan. */
+const SHUT_TIP_CURSOR = makeCursor(SHUT_TIP);
+/** On-disk state a drained run must resume exactly from. */
+const SHUT_CURSOR_FILE =
+  JSON.stringify(
+    {
+      version: 1,
+      updatedAt: "2026-01-01T00:00:00.000Z",
+      targets: {
+        market: { cursor: "123-0", lastEventLedger: 100 },
+        squad: { cursor: "456-0", lastEventLedger: 200 },
+      },
+    },
+    null,
+    2,
+  ) + "\n";
+const FROZEN_NOW = 1_700_000_000_000;
+
+const { Address, Keypair, nativeToScVal } = await import("@stellar/stellar-sdk");
+const CREATOR = Keypair.fromRawEd25519Seed(Buffer.alloc(32, 7)).publicKey();
+
+/** Raw contract event that decodes to a notifiable `claim_created`. */
+function claimCreatedEvent(claimId) {
+  return {
+    // Unique paging token per claim so scan-level dedupe keeps each event.
+    id: `${SHUT_TIP}-${claimId}`,
+    contractId: MARKET_ID,
+    ledger: SHUT_TIP,
+    txHash: "ab".repeat(32),
+    ledgerClosedAt: "2026-01-01T00:00:00.000Z",
+    topic: [
+      nativeToScVal("claim_created", { type: "string" }),
+      nativeToScVal(BigInt(claimId), { type: "u64" }),
+      Address.account(Buffer.from(Keypair.fromPublicKey(CREATOR).rawPublicKey())).toScVal(),
+    ],
+    value: nativeToScVal({ category: "crypto" }),
+  };
+}
+
+/** A promise plus its resolver, so a fake can signal and a test can release. */
+function gate() {
+  let open = () => undefined;
+  const promise = new Promise((resolve) => {
+    open = resolve;
+  });
+  return { promise, open };
+}
+
+/**
+ * Chain fake where the market target completes (cursor advances) and the squad
+ * target can be held open — exactly the window a shutdown has to flush.
+ */
+function drainingServer({ marketEvents = [], squadStarted = null, squadGate = null } = {}) {
+  return {
+    getHealth: async () => ({
+      status: "healthy",
+      oldestLedger: SHUT_TIP - 100,
+      latestLedger: SHUT_TIP,
+    }),
+    getEvents: async (args) => {
+      const contractId = args.filters[0].contractIds[0];
+      if (contractId === MARKET_ID) {
+        return { events: marketEvents, latestLedger: SHUT_TIP, cursor: SHUT_TIP_CURSOR };
+      }
+      squadStarted?.open();
+      if (squadGate) await squadGate.promise;
+      return { events: [], latestLedger: SHUT_TIP, cursor: args.cursor ?? SHUT_TIP_CURSOR };
+    },
+  };
+}
+
+/** A read that never resolves: the drain deadline has something to expire on. */
+function stuckServer() {
+  return {
+    getHealth: async () => ({
+      status: "healthy",
+      oldestLedger: SHUT_TIP - 100,
+      latestLedger: SHUT_TIP,
+    }),
+    getEvents: () => new Promise(() => undefined),
+  };
+}
+
+test("shutdown flushes a cursor advanced mid-cycle so a restart does not replay it", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "mimir-shutdown-flush-"));
+  const cursorFile = path.join(directory, "cursor.json");
+  await writeFile(cursorFile, SHUT_CURSOR_FILE, "utf8");
+
+  const squadReading = gate();
+  const releaseSquad = gate();
+  const sent = [];
+
+  // The market target finishes (cursor advances) and the squad target hangs,
+  // which is exactly the window where the advanced cursor exists only in memory.
+  const server = drainingServer({
+    marketEvents: [claimCreatedEvent(7)],
+    squadStarted: squadReading,
+    squadGate: releaseSquad,
+  });
+
+  const poller = createPoller({
+    config: baseConfig({
+      cursorFile,
+      maxNotificationsPerCycle: 1,
+      shutdownTimeoutMs: 30,
+    }),
+    server,
+    send: async (text) => {
+      sent.push(text);
+    },
+    now: () => FROZEN_NOW,
+  });
+
+  try {
+    await poller.start();
+    await squadReading.promise;
+
+    const result = await poller.shutdown();
+
+    assert.equal(result.drained, false, "the squad read is still blocked");
+    assert.equal(result.flushed, true);
+
+    const saved = JSON.parse(await readFile(cursorFile, "utf8"));
+    assert.equal(saved.version, 1, "the flush must not change the cursor format");
+    assert.equal(saved.targets.market.cursor, SHUT_TIP_CURSOR, "the advanced cursor reaches disk");
+    assert.equal(saved.targets.squad.cursor, "456-0", "the blocked target is untouched");
+    assert.equal(saved.updatedAt, new Date(FROZEN_NOW).toISOString(), "fake clock stamps the file");
+
+    assert.equal(sent.length, 1, "the message already delivered is not sent again");
+
+    const status = poller.status();
+    assert.equal(status.stopping, true);
+    assert.equal(status.running, false);
+    assert.equal(status.pendingFlush, false);
+    assert.equal(status.lastFlushAt, FROZEN_NOW);
+
+    // Let the abandoned cycle finish; a second shutdown waits for it.
+    releaseSquad.open();
+    const settled = await poller.shutdown({ timeoutMs: 5_000 });
+    assert.equal(settled.drained, true);
+    assert.equal(settled.flushed, true);
+
+    const restarted = createPoller({
+      config: baseConfig({ cursorFile }),
+      server: stuckServer(),
+      send: async () => undefined,
+    });
+    try {
+      await restarted.start();
+      assert.equal(restarted.status().targets[0].contractId, MARKET_ID);
+      assert.equal(restarted.status().targets[1].contractId, SQUAD_ID);
+      assert.equal(restarted.status().targets[0].cursor, SHUT_TIP_CURSOR);
+      assert.equal(restarted.status().targets[1].cursor, "456-0");
+      assert.equal(restarted.status().targets[0].lastEventLedger, SHUT_TIP);
+    } finally {
+      restarted.stop();
+    }
+  } finally {
+    releaseSquad.open();
+    poller.stop();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("shutdown drops the rest of an in-flight burst instead of replaying it", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "mimir-shutdown-drop-"));
+  const cursorFile = path.join(directory, "cursor.json");
+  await writeFile(cursorFile, SHUT_CURSOR_FILE, "utf8");
+
+  const enteredSend = gate();
+  const releaseSend = gate();
+  let sendCalls = 0;
+  const warnings = [];
+  const originalWarn = console.warn;
+  console.warn = (...args) => warnings.push(args.join(" "));
+
+  const server = drainingServer({ marketEvents: [claimCreatedEvent(7), claimCreatedEvent(8)] });
+
+  const poller = createPoller({
+    config: baseConfig({ cursorFile, shutdownTimeoutMs: 5_000 }),
+    server,
+    send: async (text) => {
+      sendCalls += 1;
+      enteredSend.open();
+      if (sendCalls === 1) await releaseSend.promise;
+      return undefined;
+    },
+    now: () => FROZEN_NOW,
+  });
+
+  try {
+    await poller.start();
+    await enteredSend.promise;
+
+    const draining = poller.shutdown({ timeoutMs: 5_000 });
+    releaseSend.open();
+    const result = await draining;
+
+    assert.equal(result.drained, true);
+    assert.equal(result.flushed, true);
+    assert.equal(sendCalls, 1, "only the send already in flight is attempted");
+
+    const status = poller.status();
+    assert.equal(status.notificationsSent, 1);
+    assert.equal(status.notificationsDropped, 1, "the remainder is counted, not silently lost");
+    assert.equal(status.notificationsFailed, 0, "a dropped send is not a failed send");
+    assert.equal(status.eventsSkipped, 0);
+    assert.equal(
+      warnings.some((line) => line.includes("dropped 1 unsent notification")),
+      true,
+      "the drop is logged once and bounded",
+    );
+    assert.equal(
+      warnings.join("\n").includes(baseConfig().botToken),
+      false,
+      "shutdown logs never carry the bot token",
+    );
+
+    const saved = JSON.parse(await readFile(cursorFile, "utf8"));
+    assert.equal(
+      saved.targets.market.cursor,
+      SHUT_TIP_CURSOR,
+      "the cursor still advances past the drop",
+    );
+  } finally {
+    console.warn = originalWarn;
+    releaseSend.open();
+    poller.stop();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("shutdown is bounded by its deadline and never clobbers the cursor file", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "mimir-shutdown-deadline-"));
+  const cursorFile = path.join(directory, "cursor.json");
+  await writeFile(cursorFile, SHUT_CURSOR_FILE, "utf8");
+  const original = await readFile(cursorFile, "utf8");
+
+  const poller = createPoller({
+    config: baseConfig({ cursorFile, shutdownTimeoutMs: 9_000 }),
+    server: stuckServer(),
+    send: async () => undefined,
+  });
+
+  try {
+    await poller.start();
+    const startedAt = Date.now();
+    const result = await poller.shutdown({ timeoutMs: 80 });
+    const elapsed = Date.now() - startedAt;
+
+    assert.equal(result.drained, false, "a cycle that never finishes is abandoned");
+    assert.equal(result.flushed, true, "nothing was pending, so memory still matches the file");
+    assert.ok(result.waitedMs >= 60, `waited ${result.waitedMs}ms for an 80ms budget`);
+    assert.ok(elapsed < 5_000, `shutdown took ${elapsed}ms, well past its budget`);
+
+    const status = poller.status();
+    assert.equal(status.running, false);
+    assert.equal(status.stopping, true);
+    assert.equal(status.pendingFlush, false);
+    assert.equal(poller.pause(), "stopped");
+    assert.equal(poller.resume(), "stopped");
+
+    // The abandoned cycle never wrote, and the flush did not invent a file.
+    assert.equal(await readFile(cursorFile, "utf8"), original);
+    assert.equal(existsSync(`${cursorFile}.tmp`), false, "no partial write is left behind");
+
+    // A budget of 0 is a hard "do not wait", not a hang.
+    const immediate = await poller.shutdown({ timeoutMs: 0 });
+    assert.equal(immediate.drained, false);
+    assert.equal(immediate.flushed, true);
+  } finally {
+    poller.stop();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("stop() stays immediate: no drain, no flush, no cursor file created", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "mimir-stop-only-"));
+  const cursorFile = path.join(directory, "cursor.json");
+
+  const poller = createPoller({
+    config: baseConfig({ cursorFile, shutdownTimeoutMs: 9_000 }),
+    server: stuckServer(),
+    send: async () => undefined,
+  });
+
+  try {
+    await poller.start();
+    poller.stop();
+
+    const status = poller.status();
+    assert.equal(status.running, false);
+    assert.equal(status.stopping, false, "stop() is the immediate path, not the graceful one");
+    assert.equal(status.pendingFlush, false);
+    assert.equal(existsSync(cursorFile), false, "stop() writes nothing");
+    assert.equal(poller.pause(), "stopped");
+    assert.equal(poller.resume(), "stopped");
+  } finally {
+    poller.stop();
+    await rm(directory, { recursive: true, force: true });
+  }
 });

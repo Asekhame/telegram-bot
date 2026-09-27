@@ -7,16 +7,23 @@
  * state. All chain logic lives in `src/poller.ts` and `src/stellar/`.
  */
 
-import { Bot } from "grammy";
-import type { UserFromGetMe } from "grammy/types";
 import { Bot, type Context } from "grammy";
+import type { UserFromGetMe } from "grammy/types";
 
-import { escapeMd, previewMessage, safeErrorMessage } from "./notifications/format.js";
+import { escapeMd, previewMessage, safeErrorMessage, type ExplorerKeyboard } from "./notifications/format.js";
 export { previewMessage } from "./notifications/format.js";
 import { networkLabel, type BotConfig } from "./config.js";
 import { contractExplorerUrl } from "./stellar/client.js";
-import { buildHealthReport } from "./health.js";
+import type { ContractSource } from "./stellar/decode.js";
+import { buildHealthReport, chainClockLabel } from "./health.js";
 import type { PollerPauseResult, PollerResumeResult, PollerStatus } from "./poller.js";
+import {
+  AUDIT_REPORT_MAX_ENTRIES,
+  readAuditFile,
+  renderAuditReport,
+  type AuditFileSummary,
+  type AuditLog,
+} from "./audit.js";
 
 const HELP_BASE = [
   "*Mimir notifier*",
@@ -24,6 +31,7 @@ const HELP_BASE = [
   "I watch Mimir's two Soroban contracts on Stellar and post every new on-chain event here: claims opened, challenges staked, oracle resolutions, settlements and payouts\\.",
   "",
   "/status — what I am watching and how far I have read",
+  "/audit — the operator audit report, redacted and bounded (operator only)",
   "/contracts — the contract ids I watch and where to look them up",
   "/health — health assessment and operational readiness",
   "/preview — preview channel notification formatting",
@@ -53,6 +61,20 @@ function ago(timestamp: number | null, nowMs: number = Date.now()): string {
   return `${Math.round(seconds / 3600)}h ago`;
 }
 
+const AUDIT_COMMAND_HINT = "See `npm run audit -- --help` for the standalone report tool.";
+
+/**
+ * Render the audit report for Telegram. The report is plain text — audit lines
+ * are arbitrary redacted strings and MarkdownV2 would mangle them — so nothing
+ * here goes through MarkdownV2 escaping; this message is sent without a parse
+ * mode. Bounded twice over: the file read is capped and only the tail renders.
+ */
+function renderAuditForTelegram(summary: AuditFileSummary, tail: number): string {
+  const header = `*Audit* — ${summary.file}`;
+  const report = renderAuditReport(summary, { tail });
+  return `${header}\n\n${report}\n\n${AUDIT_COMMAND_HINT}`;
+}
+
 function cursorPreview(cursor: string | null): string {
   if (cursor === null) return "none (cold start)";
   const compact = cursor.replace(/\s+/g, " ").replace(/[`\\]/g, "?").trim() || "empty";
@@ -60,17 +82,37 @@ function cursorPreview(cursor: string | null): string {
 }
 
 function statusMessage(config: BotConfig, status: PollerStatus, nowMs: number = Date.now()): string {
+  const lifecycle = status.stopping
+    ? "stopping"
+    : status.paused
+      ? "paused"
+      : status.running
+        ? "running"
+        : "stopped";
+
   const lines: string[] = [
-    `*Status* — ${status.paused ? "paused" : status.running ? "running" : "stopped"} on Stellar ${networkLabel(config)}`,
+    `*Status* — ${lifecycle} on Stellar ${networkLabel(config)}`,
     `Channel preview: ${config.channelPreviewMode ? "enabled" : "disabled"}`,
     "",
     `Chain tip: ${status.latestLedger ?? "unknown"}`,
     `RPC retains from ledger: ${status.oldestLedger ?? "unknown"}`,
+    `Chain clock skew: ${escapeMd(chainClockLabel(status.chainClockAt, nowMs))}`,
     `Poll interval: ${Math.round(config.pollIntervalMs / 1000)}s · last poll ${ago(status.lastPollAt, nowMs)}`,
-    `Cycles: ${status.cycles} · sent ${status.notificationsSent} · failed sends ${status.notificationsFailed} · skipped ${status.eventsSkipped}`,
+    `Cycles: ${status.cycles} · sent ${status.notificationsSent} · failed sends ${status.notificationsFailed} · skipped ${status.eventsSkipped}` +
+      (status.notificationsDropped
+        ? ` · dropped during shutdown ${status.notificationsDropped}`
+        : ""),
     "",
     "*Watching*",
   ];
+
+  // Only shown after an automatic recovery, so an ordinary /status is unchanged.
+  if (status.cursorRewinds > 0) {
+    lines.push(
+      `Cursors rewound to the retained floor: ${status.cursorRewinds}`,
+      "",
+    );
+  }
 
   for (const target of status.targets) {
     lines.push(
@@ -89,6 +131,15 @@ function statusMessage(config: BotConfig, status: PollerStatus, nowMs: number = 
   }
   if (status.consecutiveFailures > 0) {
     lines.push(`Consecutive failed cycles: ${status.consecutiveFailures}`);
+  }
+
+  if (status.stopping) {
+    lines.push(
+      "",
+      "Graceful shutdown in progress: no new cycles, unsent notifications dropped" +
+        (status.pendingFlush ? ", cursor flush still pending" : ", cursor flushed") +
+        "\\.",
+    );
   }
 
   return lines.join("\n");
@@ -118,6 +169,7 @@ export function healthMessage(
     `Poll interval: ${Math.round(config.pollIntervalMs / 1000)}s · last poll ${ago(status.lastPollAt, nowMs)}`,
     `Last successful poll: ${ago(status.lastSuccessAt, nowMs)}`,
     `Chain tip: ${report.poller.latestLedger ?? "unknown"}`,
+    `Chain clock skew: ${escapeMd(chainClockLabel(status.chainClockAt, nowMs))}`,
     `Cycles: ${report.poller.cycles} · consecutive failures: ${report.poller.consecutiveFailures}`,
     `Notifications: sent ${report.poller.notificationsSent} · failed ${report.poller.notificationsFailed} · skipped ${report.poller.eventsSkipped}`,
     "",
@@ -198,11 +250,17 @@ export function resumeMessage(result: PollerResumeResult): string {
 export interface BotDeps {
   config: BotConfig;
   status: () => PollerStatus;
+  /** Live in-memory audit window; renders immediately even before a flush. */
+  audit?: AuditLog | undefined;
+  /** Where the audit JSONL file lives, for the file-backed report. */
+  auditFile?: string | undefined;
   /**
    * Pre-populated bot info. When provided (e.g. in tests) grammy skips the
    * getMe() call so `bot.handleUpdate()` works without a real Telegram token.
    */
   botInfo?: UserFromGetMe;
+  pause: () => PollerPauseResult;
+  resume: () => PollerResumeResult;
 }
 
 /**
@@ -220,198 +278,13 @@ function isChatAllowed(allowedChatIds: string[], chatId: number): boolean {
   return allowedChatIds.some((allowed) => allowed === asString);
 }
 
-export function createBot(deps: BotDeps): Bot {
-  const { config, status } = deps;
-  const bot = new Bot(config.botToken, deps.botInfo !== undefined ? { botInfo: deps.botInfo } : undefined);
-  pause: () => PollerPauseResult;
-  resume: () => PollerResumeResult;
-}
-
-export function isOperator(ctx: Context, config: BotConfig): boolean {
+function isOperator(ctx: Context, config: BotConfig): boolean {
   const operatorId = config.operatorTelegramUserId;
   return operatorId !== null && ctx.from?.id.toString() === operatorId;
 }
 
-function isMessageNotModified(err: unknown): boolean {
-  if (!err) return false;
-  const msg = err instanceof Error ? err.message : String(err);
-  return /message is not modified/i.test(msg);
-}
-
-export async function safeAnswerCallback(
-  ctx: Context,
-  config: BotConfig,
-  params: { text?: string; show_alert?: boolean } = {},
-): Promise<void> {
-  if (ctx.callbackQuery?.id) {
-    try {
-      await ctx.answerCallbackQuery(params);
-    } catch (err) {
-      console.warn(
-        `[bot] answerCallbackQuery failed: ${safeErrorMessage(err, [config.botToken])}`,
-      );
-    }
-  }
-}
-
-export async function updateOrReplyMessage(
-  ctx: Context,
-  text: string,
-  replyMarkup?: InlineKeyboard,
-): Promise<void> {
-  const options = {
-    ...TELEGRAM_OPTIONS,
-    ...(replyMarkup ? { reply_markup: replyMarkup } : {}),
-  };
-
-  if (ctx.callbackQuery?.message) {
-    try {
-      await ctx.editMessageText(text, options);
-      return;
-    } catch (err) {
-      if (isMessageNotModified(err)) {
-        return;
-      }
-      // If edit failed (e.g. message too old or deleted), fall through to reply
-    }
-  }
-
-  if (ctx.chat) {
-    await ctx.reply(text, options);
-    return;
-  }
-
-  // no-op: callers that need to target the configured chat should call
-  // `ctx.api.sendMessage(config.chatId, ...)` directly when `ctx.chat` is
-  // unavailable. handleCallbackQuery does this.
-}
-
-export async function handleCallbackQuery(
-  ctx: Context,
-  deps: BotDeps,
-): Promise<void> {
-  const { config, status } = deps;
-  const pause = deps.pause ?? (() => "stopped");
-  const resume = deps.resume ?? (() => "stopped");
-  const rawData = ctx.callbackQuery?.data;
-
-  // Validate callback query data before acting
-  const validation = validateCallbackData(rawData);
-
-  if (!validation.ok) {
-    console.warn(
-      `[bot] rejected invalid callback query (${validation.reason}) on update ${ctx.update.update_id}`,
-    );
-    await safeAnswerCallback(ctx, config, {
-      text: validation.fallbackText,
-      show_alert: false,
-    });
-    return;
-  }
-
-  const { action } = validation;
-
-  // Enforce operator role authorization
-  if (action.type === "pause" || action.type === "resume") {
-    if (!isOperator(ctx, config)) {
-      console.warn(
-        `[bot] ignored unauthorized callback /${action.type} on update ${ctx.update.update_id}`,
-      );
-      await safeAnswerCallback(ctx, config, {
-        text: CALLBACK_UNAUTHORIZED_FEEDBACK,
-        show_alert: true,
-      });
-      return;
-    }
-  }
-
-  // Execute validated action
-  try {
-    switch (action.type) {
-      case "status": {
-        const text = statusMessage(config, status());
-        if (ctx.callbackQuery?.message) {
-          await updateOrReplyMessage(ctx, text, statusKeyboard(config));
-        } else {
-          await ctx.api.sendMessage(config.chatId, text, {
-            ...TELEGRAM_OPTIONS,
-            reply_markup: statusKeyboard(config),
-          });
-        }
-        await safeAnswerCallback(ctx, config, { text: "Status refreshed" });
-        break;
-      }
-
-      case "contracts": {
-        const text = contractsMessage(config);
-        if (ctx.callbackQuery?.message) {
-          await updateOrReplyMessage(ctx, text, contractsKeyboard());
-        } else {
-          await ctx.api.sendMessage(config.chatId, text, TELEGRAM_OPTIONS);
-        }
-        await safeAnswerCallback(ctx, config, { text: "Contracts" });
-        break;
-      }
-
-      case "help": {
-        const text = helpMessage(config);
-        if (ctx.callbackQuery?.message) {
-          await updateOrReplyMessage(ctx, text);
-        } else {
-          await ctx.api.sendMessage(config.chatId, text, TELEGRAM_OPTIONS);
-        }
-        await safeAnswerCallback(ctx, config, { text: "Help" });
-        break;
-      }
-
-      case "pause": {
-        const result = pause();
-        const text = pauseMessage(result);
-        if (ctx.callbackQuery?.message) {
-          await updateOrReplyMessage(ctx, text, operatorKeyboard());
-        } else {
-          await ctx.api.sendMessage(config.chatId, text, TELEGRAM_OPTIONS);
-        }
-        await safeAnswerCallback(ctx, config, {
-          text: result === "paused" ? "Polling paused" : result === "already-paused" ? "Already paused" : "Cannot pause",
-        });
-        break;
-      }
-
-      case "resume": {
-        const result = resume();
-        const text = resumeMessage(result);
-        if (ctx.callbackQuery?.message) {
-          await updateOrReplyMessage(ctx, text, operatorKeyboard());
-        } else {
-          await ctx.api.sendMessage(config.chatId, text, TELEGRAM_OPTIONS);
-        }
-        await safeAnswerCallback(ctx, config, {
-          text: result === "resumed" ? "Polling resumed" : result === "already-running" ? "Already running" : "Cannot resume",
-        });
-        break;
-      }
-    }
-  } catch (err) {
-    console.error(
-      `[bot] callback error on action ${action.type}: ${safeErrorMessage(err, [config.botToken])}`,
-    );
-    await safeAnswerCallback(ctx, config, { text: "Action failed" });
-  }
-}
-
-/** Register callback handlers on a grammy-compatible bot or mock. */
-export function registerCallbackHandlers(
-  bot: Bot | { on: (event: string, handler: (ctx: Context) => Promise<void>) => void },
-  deps: BotDeps,
-): void {
-  (bot as { on: (event: string, handler: (ctx: Context) => Promise<void>) => void }).on(
-    "callback_query",
-    async (ctx: Context) => {
-      await handleCallbackQuery(ctx, deps);
-    },
-  );
-}
+/** How many recent audit lines `/audit` renders. A chat message is not a file. */
+const AUDIT_TAIL = 10;
 
 /** Register command handlers on a grammy-compatible bot (also useful in tests). */
 export function registerCommandHandlers(
@@ -441,11 +314,40 @@ export function registerCommandHandlers(
       );
       return;
     }
-    await ctx.reply(statusMessage(config, status()), {
-      parse_mode: "MarkdownV2",
-      link_preview_options: { is_disabled: true },
-    });
     await ctx.reply(statusMessage(config, status()), TELEGRAM_OPTIONS);
+  });
+
+  bot.command("audit", async (ctx) => {
+    if (!isOperator(ctx, config)) {
+      // Same authorization model as /pause and /resume: the report is only
+      // meant for the operator, so other users get silence, not an error that
+      // would confirm the command exists. The standalone `npm run audit` CLI
+      // is the credential-free path for anyone with machine access.
+      console.warn(`[bot] ignored unauthorized /audit on update ${ctx.update.update_id}`);
+      return;
+    }
+    try {
+      const file = deps.auditFile ?? config.auditFile;
+      const summary = await readAuditFile(file);
+
+      // The in-memory window also holds entries recorded since the last flush;
+      // append any of those the file does not already contain (same entries
+      // serialise identically) so the report is current without duplicates.
+      const seen = new Set(summary.entries.map((e) => JSON.stringify(e)));
+      const live = (deps.audit ? deps.audit.tail(AUDIT_TAIL) : []).filter(
+        (e) => !seen.has(JSON.stringify(e)),
+      );
+
+      const merged: AuditFileSummary = {
+        ...summary,
+        entries: [...summary.entries, ...live].slice(-AUDIT_REPORT_MAX_ENTRIES),
+      };
+      await ctx.reply(renderAuditForTelegram(merged, AUDIT_TAIL), {
+        link_preview_options: { is_disabled: true },
+      });
+    } catch (err) {
+      await ctx.reply(`Audit report failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
   });
 
   // Config-only, so this never fails on account of poller or RPC state —
@@ -483,12 +385,7 @@ export function registerCommandHandlers(
 }
 
 export function createBot(deps: BotDeps): Bot {
-  // Allow tests and partial harness overrides to omit a real token by using a
-  // harmless placeholder. In production `config.botToken` should always be
-  // provided; this only prevents grammy from throwing during certain unit
-  // tests where the test harness accidentally passes a partial config.
-  const token = deps.config?.botToken ?? process.env.BOT_TOKEN ?? "TEST-BOT-TOKEN";
-  const bot = new Bot(token);
+  const bot = new Bot(deps.config.botToken, deps.botInfo !== undefined ? { botInfo: deps.botInfo } : undefined);
   registerCommandHandlers(bot, deps);
   registerCallbackHandlers(bot, deps);
 
@@ -504,10 +401,26 @@ export function createBot(deps: BotDeps): Bot {
   return bot;
 }
 
-/** The poller's send path: one message to the configured chat. */
+/** Extra Telegram send options the poller may attach to a notification. */
+export interface SendExtra {
+  reply_markup?: ExplorerKeyboard | undefined;
+}
+
+/**
+ * The poller's send path: route each contract's messages to its named chat,
+ * with the event's explorer button when `extra.reply_markup` is set.
+ */
 export function createNotifier(bot: Bot, config: BotConfig) {
-  return async (text: string): Promise<void> => {
-    await bot.api.sendMessage(config.chatId, text, TELEGRAM_OPTIONS);
+  return async (text: string, source?: ContractSource, extra?: SendExtra): Promise<void> => {
+    const chatId = source === "market"
+      ? config.marketChatId ?? config.chatId
+      : source === "squad"
+        ? config.squadChatId ?? config.chatId
+        : config.chatId;
+    await bot.api.sendMessage(chatId, text, {
+      ...TELEGRAM_OPTIONS,
+      ...(extra?.reply_markup ? { reply_markup: extra.reply_markup } : {}),
+    });
   };
 }
 
@@ -518,6 +431,7 @@ export async function registerCommands(bot: Bot): Promise<void> {
       { command: "start", description: "What this bot does" },
       { command: "help", description: "Show help" },
       { command: "status", description: "Last-seen ledger and watched contracts" },
+      { command: "audit", description: "Operator audit report (redacted, bounded)" },
       { command: "contracts", description: "Contract ids and explorer links" },
       { command: "health", description: "Health assessment and operational readiness" },
       { command: "preview", description: "Preview channel notification formatting" },
