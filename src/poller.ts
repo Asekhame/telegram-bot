@@ -61,7 +61,8 @@ import {
   InstanceLockError,
   type InstanceLockHandle,
 } from "./instanceLock.js";
-import { explorerKeyboard, formatEvent, safeErrorMessage } from "./notifications/format.js";
+import { explorerKeyboard, formatEvent, formatPlainTextEvent, safeErrorMessage } from "./notifications/format.js";
+import { isNotificationAllowed } from "./notifications/featureFlags.js";
 import { buildStatusSnapshot, writeStatusFile, type StatusSnapshot } from "./status.js";
 import { validateLedgerWindow, type LedgerWindow } from "./stellar/client.js";
 import {
@@ -85,6 +86,8 @@ export interface TargetState {
    * restart mid-rewind keeps reading from the floor rather than cold-starting.
    */
   rewindFromLedger: number | null;
+  /** RPC has rejected this target's cursor as stale; clears after a successful scan. */
+  cursorStale: boolean;
   lastError: string | null;
 }
 
@@ -710,6 +713,95 @@ function isStaleCursorError(message: string): boolean {
   );
 }
 
+
+/** Minimal RPC health surface used at boot (fakeable in tests). */
+export interface RpcHealthProbe {
+  getHealth: () => Promise<{
+    status: string;
+    latestLedger: number;
+    oldestLedger: number;
+  }>;
+}
+
+export interface StartupHealthOptions {
+  /** Wall-clock budget for retries from the first attempt. */
+  deadlineMs: number;
+  /** Delay between failed attempts (capped by remaining deadline). */
+  retryMs: number;
+  /** Optional clock for deterministic tests. */
+  now?: () => number;
+  /** Optional sleeper for deterministic tests. */
+  sleep?: (ms: number) => Promise<void>;
+}
+
+/**
+ * Retry `getHealth()` until it succeeds or the deadline elapses.
+ *
+ * Used at process startup so a briefly unavailable RPC (deploy race, Testnet
+ * blip) does not fail the whole boot, while a permanently wrong URL still
+ * surfaces within a bounded window. Never logs tokens or full remote bodies.
+ */
+export async function waitForStartupHealth(
+  rpc: RpcHealthProbe,
+  options: StartupHealthOptions,
+): Promise<{
+  status: string;
+  latestLedger: number;
+  oldestLedger: number;
+  attempts: number;
+}> {
+  const now = options.now ?? Date.now;
+  const sleepFn = options.sleep ?? sleep;
+  const deadlineMs = Math.max(0, options.deadlineMs);
+  const retryMs = Math.max(0, options.retryMs);
+  const startedAt = now();
+  const deadlineAt = startedAt + deadlineMs;
+
+  let attempts = 0;
+  let lastError: unknown;
+
+  while (true) {
+    attempts += 1;
+    try {
+      const health = await rpc.getHealth();
+      if (attempts > 1) {
+        console.log(
+          `[poller] startup RPC health ok after ${attempts} attempt(s) ` +
+            `(${Math.max(0, now() - startedAt)}ms): status=${health.status} ` +
+            `ledgers ${health.oldestLedger}..${health.latestLedger}`,
+        );
+      }
+      return {
+        status: health.status,
+        latestLedger: health.latestLedger,
+        oldestLedger: health.oldestLedger,
+        attempts,
+      };
+    } catch (err) {
+      lastError = err;
+      const remaining = deadlineAt - now();
+      if (remaining <= 0 || retryMs <= 0) {
+        break;
+      }
+      const waitMs = Math.min(retryMs, remaining);
+      console.warn(
+        `[poller] startup RPC health attempt ${attempts} failed; ` +
+          `retrying in ${waitMs}ms (deadline ${deadlineMs}ms): ${safeErrorMessage(err)}`,
+      );
+      await sleepFn(waitMs);
+      if (now() >= deadlineAt) {
+        break;
+      }
+    }
+  }
+
+  throw new Error(
+    `RPC startup health check failed after ${attempts} attempt(s) ` +
+      `within ${deadlineMs}ms deadline: ${safeErrorMessage(lastError)}`,
+  );
+}
+
+
 /**
  * Sends a message with bounded exponential backoff.
  *
@@ -789,6 +881,7 @@ export function createPoller(deps: PollerDeps) {
         cursor: null,
         lastEventLedger: null,
         rewindFromLedger: null,
+        cursorStale: false,
         lastError: null,
       },
     ]),
@@ -900,6 +993,7 @@ export function createPoller(deps: PollerDeps) {
         // A rewind that was still pending when the process stopped resumes from
         // the same floor instead of falling back to a lookback cold start.
         target.rewindFromLedger = saved.rewindFromLedger ?? null;
+        target.cursorStale = target.rewindFromLedger !== null;
         // Restore the redelivery window too. Without this a restart would
         // re-notify the last event the inclusive cursor hands back.
         dedup.set(key, EventDedupWindow.fromJSON(saved.recentEventIds, config.dedupWindow));
@@ -1066,6 +1160,16 @@ export function createPoller(deps: PollerDeps) {
         continue;
       }
 
+      if (!isNotificationAllowed(config.featureFlags, event.source, event.payload.name)) {
+        status.eventsSkipped += 1;
+        skipped += 1;
+        console.log(
+          `[poller] feature-flag skipped ${event.source} event "${boundedLabel(event.payload.name, 80)}" ` +
+            `at ledger ${event.ledger} (NOTIFY_* flags)`,
+        );
+        continue;
+      }
+
       // A shutdown keeps the drain bounded: messages that have not started are
       // dropped, counted, and left to the chain. The cursor still advances past
       // them below, so the next start does not replay them into the channel.
@@ -1084,7 +1188,18 @@ export function createPoller(deps: PollerDeps) {
         text = formatEvent(config, event);
         if (text !== null) {
           const reply_markup = explorerKeyboard(config, event);
-          if (reply_markup) extra = { reply_markup };
+          // Plain-text twin for the MarkdownV2 parse fallback in createNotifier.
+          // Same event, no Markdown of any kind; the notifier sends it at most
+          // once, only when Telegram rejects the entities. Cursor accounting
+          // below is unchanged: either path counts as sent, neither as skipped.
+          const plainText = formatPlainTextEvent(config, event);
+          const eventRef = { eventId: event.eventId, ledger: event.ledger, source: event.source };
+          if (reply_markup || plainText !== null) {
+            extra = {
+              ...(reply_markup ? { reply_markup } : {}),
+              ...(plainText !== null ? { plainText, eventRef } : {}),
+            };
+          }
         }
       } catch (err) {
         status.eventsSkipped += 1;
@@ -1294,6 +1409,7 @@ export function createPoller(deps: PollerDeps) {
           status.latestLedger = scan.latestLedger;
           status.oldestLedger = scan.oldestLedger;
           current.lastError = null;
+          current.cursorStale = false;
           anyOk = true;
 
           if (previousFailed) {
@@ -1405,11 +1521,15 @@ export function createPoller(deps: PollerDeps) {
         } catch (err) {
           cycleFailures++;
           const message = errorMessage(err);
+          const staleCursor = isStaleCursorError(message);
           current.lastError = message;
+          if (staleCursor) current.cursorStale = true;
           status.lastError = { at: now(), message: `${target.source}: ${message}` };
           audit.recordError(err, "cycle_failed", { source: target.source });
-          console.error(`[poller] ${target.source} scan failed: ${message}`);
-          if (isStaleCursorError(message)) {
+          console.error(
+            `[poller] ${target.source} scan failed${staleCursor ? " (stale cursor)" : ""}: ${message}`,
+          );
+          if (staleCursor) {
             audit.record(
               auditEntry("stale_cursor", {
                 source: target.source,

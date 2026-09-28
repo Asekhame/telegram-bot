@@ -259,6 +259,14 @@ test("safeErrorMessage redacts Telegram-shaped tokens and clips remote payloads"
   assert.match(message, /^\[REDACTED] \[REDACTED] remote-payload/);
 });
 
+test("safeErrorMessage redacts tokens ending in URL punctuation", () => {
+  const hyphenToken = "123456789:BOT-TOKEN-ABCDEFGHIJKLMN-";
+  const underscoreToken = "987654321:BOT_TOKEN_ZYXWVUTSRQPON_";
+  const message = safeErrorMessage(new Error(`${hyphenToken}, ${underscoreToken}.`));
+
+  assert.equal(message, "[REDACTED], [REDACTED].");
+});
+
 test("/preview command sends exact MarkdownV2 preview payload for market and squad", async () => {
   const { handlers } = mockedBot({
     config: baseConfig(),

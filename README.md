@@ -115,6 +115,14 @@ looks healthy but notifies nobody.
 | `/pause` | Operator only. Stops scheduling new poll cycles; a scan already in progress may finish and persist its normal cursor |
 | `/resume` | Operator only. Schedules the next poll cycle immediately, without changing or replaying cursors |
 
+`/start`, `/help`, and Telegram's command menu are generated from the same
+command metadata used to register handlers. Without `OPERATOR_TELEGRAM_USER_ID`,
+the help and menu omit `/audit`, `/pause`, and `/resume`; configured operator
+commands are labelled "Operator only". Help uses static metadata, so it remains
+available when the poller or RPC is unhealthy. Adding a command requires its
+metadata and handler in `src/bot.ts`; TypeScript checks that every registry entry
+has a handler. This changes no cursor files or deployment settings.
+
 Commands from a user other than `OPERATOR_TELEGRAM_USER_ID` receive no control
 response and cannot mutate poller state — this includes `/audit`, whose report
 is operator-only. Repeated `/pause` or `/resume` commands
@@ -207,6 +215,98 @@ stays valid. Each target reports its `startLedger` and `startClamped`, so it is
 clear when a requested `--from` was moved up to the retained floor. Neither mode
 prints bot tokens or signing keys — the scanner never holds them. This is how the
 decoder was verified against the live deployment.
+
+## Cursor-range replay
+
+Replay reads a fixed ledger range from the chain and optionally re-posts the
+events to Telegram. It is one-shot: it exits when the range is exhausted and
+**never writes a cursor file** — the live poller's cursor state is untouched.
+
+```bash
+npm run replay -- --from 4226500                 # dry-run: decode only, no send
+npm run replay -- --from 4226500 --to 4226800    # bounded range
+npm run replay -- --from 4226500 --send          # send to Telegram (needs BOT_TOKEN)
+npm run replay -- --from 4226500 --contract market  # one contract only
+npm run replay -- --from 4226500 --json          # machine-readable mimir-replay-v1
+npm run replay -- --from 4226500 --pages 5       # walk at most 5 pages per contract
+npm run replay -- --from 4226500 --cap 10        # cap at 10 notifications per contract
+npm run replay:mock -- --from 4226500            # local mock profile, no credentials
+```
+
+**Flags:**
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--from <ledger\|cursor>` | (required) | Start of the range — a ledger number or an opaque RPC cursor |
+| `--to <ledger>` | chain tip | End of the range (inclusive). Clamped to the tip when above it |
+| `--send` | off | Actually post to Telegram; requires `BOT_TOKEN` and `TELEGRAM_CHAT_ID` |
+| `--contract market\|squad` | both | Scan only the named contract |
+| `--pages <n>` | 20 | Page budget per contract |
+| `--cap <n>` | `MAX_NOTIFICATIONS_PER_CYCLE` | Maximum notifications per contract per run |
+| `--show <n>` | 0 | Include the last *n* decoded events per target in the report |
+| `--json` | off | Machine-readable `mimir-replay-v1` JSON on stdout; progress on stderr |
+| `--mock` | off | `MIMIR_PROFILE=mock`: local RPC, fixture contracts, no credentials needed |
+
+**Default mode is dry-run.** Events are decoded and counted; nothing is posted to
+Telegram. Add `--send` to deliver notifications. The run always exits with code
+`0` on completion, `1` on a fatal RPC or config error, and `2` on a bad flag.
+
+**Cursor clamping.** `--from` below the RPC's retained floor is moved up to the
+floor with a warning. `--to` above the chain tip is clamped to the tip. A `--to`
+before `--from` is a usage error (exit 2). Neither clamp changes the live
+poller's cursor.
+
+**Bounded output.** Admin events (`oracle_changed`, `ownership_transferred`, …)
+are logged at the progress level and not sent. Unknown or malformed events are
+logged and skipped. Send failures are counted as skipped and do not abort the
+run. No bot token or private key ever appears in progress output or the JSON
+report.
+
+**JSON report shape** (`--json` stdout, one document, ends with `\n`):
+
+```json
+{
+  "format": "mimir-replay-v1",
+  "network": "testnet",
+  "rpcUrl": "https://soroban-testnet.stellar.org",
+  "fromLedger": 4226500,
+  "toLedger": 4226800,
+  "dryRun": true,
+  "targets": [
+    {
+      "source": "market",
+      "contractId": "CDV6JXIJCALSXQELCS6YUEWJWG5DFXQK5PJ5I7MWI6KVMQJBC5DLPKZI",
+      "fromLedger": 4226500,
+      "toLedger": 4226800,
+      "startLedger": 4226500,
+      "startClamped": false,
+      "pages": 3,
+      "events": 2,
+      "sent": 0,
+      "skipped": 0,
+      "capped": 0,
+      "adminLogged": 0,
+      "duplicates": 0,
+      "truncated": false,
+      "lastEventLedger": 4226729,
+      "cursor": "0018276211125911551-4294967295",
+      "eventLog": []
+    }
+  ],
+  "totals": {
+    "events": 2,
+    "sent": 0,
+    "skipped": 0,
+    "capped": 0,
+    "adminLogged": 0,
+    "duplicates": 0
+  }
+}
+```
+
+`bigint` amounts are serialized as decimal strings (same convention as
+`mimir-scan-v1`), so `npm run replay -- --json | jq` is valid. Progress and
+warnings always go to stderr.
 
 ## Operator audit trail
 
@@ -343,6 +443,17 @@ The poller now recovers from exactly that case, without guessing:
 - It is **conservative**: an opaque cursor this build cannot place, a cursor
   ahead of the tip, or a window that cannot be read is left untouched and the
   bounded RPC error is surfaced. Nothing is rewritten on a hunch.
+- A stale rejection immediately marks that target `cursorStale` in
+  `status.json` and `GET /health`, and makes readiness return `503` until that
+  target completes a successful scan. `/status` and `/health` identify whether
+  the cursor is unchanged or a retained-floor recovery is underway. The alert
+  is reconstructed after restart from the persisted rewind position or the
+  next RPC rejection; the version-1 cursor schema does not change.
+- Railway's configured `GET /health` deployment probe therefore remains
+  unready while a stale cursor is unresolved. Recovery continues in-process;
+  do not delete or replace the persistent cursor volume to force readiness.
+  `GET /health/live` stays `200` for supervisors that need process liveness
+  independently of readiness.
 - The miss is logged as a bounded ledger count (`cursor is N ledger(s) below the
   retained floor`), never as a raw RPC payload, and `/status` and `GET /health`
   expose `cursorRewinds` plus the per-target `rewindFromLedger` while it lasts.
@@ -447,6 +558,19 @@ the process exits — see [Graceful shutdown](#graceful-shutdown).
 Tests never use this directory: they run against an ephemeral data directory
 created under the OS temp dir and removed afterwards (see
 [docs/contributor-fixtures.md](docs/contributor-fixtures.md)).
+
+For local restart and regression checks without Testnet or Telegram credentials,
+seed that file with a deterministic fixture:
+
+```bash
+npm run seed:cursor                 # writes ./data/cursor.json (refuses overwrite)
+npm run seed:cursor -- --force      # replace an existing file
+npm run seed:cursor -- --empty      # null cursors (file present, cold resume)
+npm run seed:cursor -- --out /tmp/cursor.json
+```
+
+The seeder uses the same write-then-rename discipline as the poller, never reads
+bot tokens or signing keys, and refuses cursor values that look like secrets.
 
 If the file exists but is corrupt (truncated JSON, wrong `version`, or a
 non-object `targets` map), the poller renames it to
@@ -630,6 +754,11 @@ the cursor file if you want an exact resume point.
 
 ## Health endpoint
 
+Before the poller starts, boot calls Soroban RPC `getHealth()` with bounded
+retries (`STARTUP_HEALTH_DEADLINE_MS` / `STARTUP_HEALTH_RETRY_MS`) so a brief
+RPC outage does not abort startup, while a bad URL still fails within the
+deadline.
+
 The process exposes a **loopback HTTP** probe for supervisors and deploy
 checks (default `http://127.0.0.1:8787`):
 
@@ -643,22 +772,79 @@ cursors, whether a target has an error, automatic floor rewinds
 (`poller.cursorRewinds` plus each target's `rewindFromLedger`), and the chain
 clock (`poller.chainClockAt` plus `poller.chainClockSkewMs`, the signed difference
 in milliseconds between the bot's clock and the newest chain close time it has
-observed — positive while the bot is ahead). It never includes `BOT_TOKEN`, chat
-ids, private keys, or unbounded remote payloads.
+observed — positive while the bot is ahead). Each target's `cursorStale` boolean
+indicates an unresolved RPC rejection; resolving it requires a successful scan,
+not a health-probe retry or local cursor-age guess. It never includes
+`BOT_TOKEN`, chat ids, private keys, or unbounded remote payloads.
+
+### Configuration provenance
+
+`GET /health` also answers *where each setting's value came from*, and never what
+it is. That distinction is the difference between "the bot is configured" and
+"the bot is configured the way I think it is": a placeholder token inherited from
+a profile, a `.env` the process never found because it started from another
+directory, and a variable exported empty all look identical from the outside.
+
+```json
+{
+  "config": {
+    "profile": null,
+    "envFile": { "present": true, "suppliedKeys": 12 },
+    "entries": [
+      { "key": "BOT_TOKEN", "source": "env-file", "secret": true },
+      { "key": "HEALTH_PORT", "source": "derived", "derivedFrom": "PORT", "secret": false }
+    ],
+    "counts": {
+      "process-env": 3,
+      "env-file": 12,
+      "profile-default": 0,
+      "built-in-default": 6,
+      "derived": 1,
+      "unset": 4
+    },
+    "warnings": []
+  }
+}
+```
+
+`source` is one of `process-env`, `env-file`, `profile-default`,
+`built-in-default`, `derived` (another setting supplies it, named by
+`derivedFrom`), or `unset` — absent and optional, which is the normal state for
+`ALLOWED_CHAT_IDS` and `OPERATOR_TELEGRAM_USER_ID`. No value — token, chat id, or
+anything else — is ever part of the report, so it can be pasted into a ticket
+as-is; `secret: true` marks the settings that are sensitive for exactly that
+reason. `warnings` names what is worth acting on: a variable set but empty, a
+`.env` that supplies none of the known settings (usually a working-directory
+bug), an unknown `MIMIR_PROFILE`, or the mock profile being active.
+
+Boot logs the same information as one line, followed by any warnings:
+
+```
+[boot] config       profile=none env-file=present(12 keys) process-env=3 env-file=12 built-in-default=6 derived=1 unset=4 secret-keys=6/26
+[boot] config       HEALTH_STALE_MS is set but empty; the built-in default supplies the value
+```
+
+`/status` ends with the same one-line summary, so an operator can confirm which
+`.env` a deployment actually read without opening a shell.
 
 Configuration (see `.env.example`):
 
 - `HEALTH_HOST` — bind address (default `127.0.0.1`; set to `0.0.0.0` for Docker)
 - `HEALTH_PORT` — TCP port (default `8787`; `0` disables)
 - `HEALTH_STALE_MS` — degraded if no successful poll within this window after the first success (default `90000`; `0` disables)
+- A stale cursor rejection independently makes `GET /health` return `503` until its target scans successfully; `HEALTH_STALE_MS` does not disable this cursor alert.
+- `STARTUP_HEALTH_DEADLINE_MS` — wall-clock budget for retrying the boot RPC `getHealth()` probe (default `30000`; `0` = single attempt)
+- `STARTUP_HEALTH_RETRY_MS` — delay between failed boot RPC health attempts (default `1000`)
 
 **Rollback:** set `HEALTH_PORT=0` (or omit the new env keys to keep defaults) and
-redeploy the previous image — the health module is additive and does not change
-cursor format or Telegram behaviour.
+redeploy the previous image — the target alert is additive, does not change the
+version-1 cursor format or Telegram delivery, and the previous build safely
+ignores the new status field.
 
 **Failure modes:** binding fails only if the port is already taken (process
 exits via the listen error path after logging). Client disconnects and probe
 errors are logged and ignored so they cannot stop the notifier.
+- **Notification feature flags** (`NOTIFY_ENABLED`, `NOTIFY_MARKET`, `NOTIFY_SQUAD`) are coarse kill switches for Telegram posts. Disabled events are skip-logged and the cursor still advances; unset defaults keep prior always-on behavior.
 
 ## Layout
 
@@ -673,12 +859,16 @@ src/
   poller.ts                the loop: scan, notify, persist the cursor, flush audit
   audit.ts                 redaction, bounded audit log, JSONL persistence, report renderer
   audit-cli.ts             entrypoint for `npm run audit`
+  replay-cli.ts            entrypoint for `npm run replay` (cursor-range replay)
   instanceLock.ts          exclusive process lock for the cursor owner
   status.ts                machine-readable status snapshot (allowlisted, bounded)
+  dev/
+    seedCursor.ts          credential-free local cursor seeder (npm run seed:cursor)
   stellar/
     client.ts              Soroban RPC client + explorer links (tx + contract)
     events.ts              cursor-paginated getEvents (+ the standalone CLI)
     decode.ts              typed decoding of both contracts' events
+    replay.ts              cursor-range replay engine + runReplayCli() (npm run replay)
     mock-rpc.ts            local Soroban mock: scenario, pagination, failure injection
     mock-constants.ts      mock profile fixture ids, ports, placeholder credentials
   notifications/
@@ -686,6 +876,7 @@ src/
 tests/
   format.test.mjs          notification formatting (incl. deterministic fuzz)
   audit.test.mjs           redaction, entries, persistence, report rendering
+  replay.test.mjs          cursor-range replay: dry-run, send, clamp, security, cursor-safety
 ```
 
 ## Deploying on Railway
@@ -732,7 +923,8 @@ truth for IaC; follow Railway's migration guide when the time comes.
 
 ## Development checks
 
-Run `npm run typecheck` for a no-emit TypeScript check, `npm test` for the build plus the deterministic command, poller, format, fixture, mock-profile, health, lockfile and audit-trail suites (including deterministic fuzz cases; `npm run test:mock` for just the local-mock suites), or `npm run build` to produce the production output. CI runs typecheck, build, and all tests without network credentials.
+Run `npm run typecheck` for a no-emit TypeScript check, `npm test` for the build plus the deterministic command, poller, format, fixture, mock-profile, config-provenance, health, lockfile and audit-trail suites (including deterministic fuzz cases; `npm run test:mock` for just the local-mock suites), or `npm run build` to produce the production output. CI runs typecheck, build, and all tests without network credentials.
+Run `npm run seed:cursor` to write a local cursor fixture.
 
 ### Lockfile reproducibility
 
@@ -755,7 +947,7 @@ drift is caught locally without network access. To change dependencies, edit
 `package.json`, run `npm install` to regenerate the lockfile, and commit both
 files together — a lockfile that no longer matches `package.json` fails
 `npm ci`, `npm run lockfile:check`, and CI.
-Run `npm run typecheck` for a no-emit TypeScript check, `npm test` for the build plus the deterministic command, poller, ledger-window, format, fixture, mock-profile, health, lockfile and audit-trail suites (including deterministic fuzz cases; `npm run test:mock` for just the local-mock suites), or `npm run build` to produce the production output. CI runs typecheck, build, and all tests without network credentials.
+Run `npm run typecheck` for a no-emit TypeScript check, `npm test` for the build plus the deterministic command, poller, ledger-window, format, fixture, mock-profile, config-provenance, health, lockfile and audit-trail suites (including deterministic fuzz cases; `npm run test:mock` for just the local-mock suites), or `npm run build` to produce the production output. CI runs typecheck, build, and all tests without network credentials.
 
 Contributor workflow for credential-free fixtures (event catalogs, cursor samples, failure-mode expectations) lives in [docs/contributor-fixtures.md](docs/contributor-fixtures.md).
 

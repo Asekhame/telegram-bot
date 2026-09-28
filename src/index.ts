@@ -9,12 +9,20 @@
 
 import { readFile } from "node:fs/promises";
 
-import { ConfigError, activeProfileName, loadConfig, networkLabel } from "./config.js";
+import {
+  ConfigError,
+  activeProfileName,
+  configProvenance,
+  formatProvenanceSummary,
+  loadConfig,
+  networkLabel,
+} from "./config.js";
+import { formatFeatureFlags } from "./notifications/featureFlags.js";
 import { auditEntry, createAuditLog } from "./audit.js";
 import { InstanceLockError } from "./instanceLock.js";
 import { createBot, createNotifier, registerCommands, type SendExtra } from "./bot.js";
 import { startHealthServer } from "./health.js";
-import { createPoller } from "./poller.js";
+import { createPoller, waitForStartupHealth } from "./poller.js";
 import type { ContractSource } from "./stellar/decode.js";
 import { safeErrorMessage } from "./notifications/format.js";
 import { createRpcServer } from "./stellar/client.js";
@@ -102,6 +110,7 @@ async function main(): Promise<void> {
   console.log(`[boot] market       ${config.marketContractId}`);
   console.log(`[boot] squad        ${config.squadContractId}`);
   console.log(`[boot] cursor file  ${config.cursorFile}`);
+  console.log(`[boot] flags        ${formatFeatureFlags(config.featureFlags)}`);
   console.log(`[boot] audit file   ${config.auditFile}`);
   console.log(`[boot] lock file    ${config.lockFile}`);
   console.log(`[boot] shutdown     ${config.shutdownTimeoutMs}ms drain budget`);
@@ -112,13 +121,27 @@ async function main(): Promise<void> {
     `[boot] preview mode  ${config.channelPreviewMode ? "enabled" : "disabled"}`,
   );
 
+  // Which setting came from where, then anything an operator can act on. Names
+  // and origins only: a value never reaches this log, so a boot log can be
+  // pasted into a ticket without redaction.
+  const provenance = configProvenance();
+  console.log(`[boot] config       ${formatProvenanceSummary(provenance)}`);
+  for (const warning of provenance.warnings) {
+    console.warn(`[boot] config       ${warning}`);
+  }
+
   const server = createRpcServer(config);
 
-  // One read before announcing readiness: a wrong RPC URL should surface now,
-  // not as a mystery in the poll log an interval later.
-  const health = await server.getHealth();
+  // Bounded retries before announcing readiness: a briefly unavailable RPC
+  // (deploy race, Testnet blip) should not fail the whole boot, but a wrong
+  // URL must still surface within STARTUP_HEALTH_DEADLINE_MS.
+  const health = await waitForStartupHealth(server, {
+    deadlineMs: config.startupHealthDeadlineMs,
+    retryMs: config.startupHealthRetryMs,
+  });
   console.log(
-    `[boot] rpc ok, status=${health.status} ledgers ${health.oldestLedger}..${health.latestLedger}`,
+    `[boot] rpc ok (attempts=${health.attempts}), status=${health.status} ` +
+      `ledgers ${health.oldestLedger}..${health.latestLedger}`,
   );
 
   // The bot needs the poller's status and the poller needs the bot's send path,
@@ -153,7 +176,7 @@ async function main(): Promise<void> {
   // so a deploy probe can see the process even while grammy is connecting.
   const healthServer = startHealthServer({ config, status: () => poller.status() });
 
-  await registerCommands(bot);
+  await registerCommands(bot, config);
 
   // Lock first: refuse a second live instance before Telegram long-polling starts.
   // That keeps a duplicate process from racing the cursor or fighting getUpdates.

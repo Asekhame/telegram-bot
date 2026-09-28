@@ -38,6 +38,7 @@ Check:
 * RPC retained-history floor
 * chain clock skew (newest observed chain close time against this host's clock)
 * watched contract IDs
+* configuration provenance (`/health` -> `.config`, or the boot `[boot] config` line): which source supplied each setting, with no values
 * last event ledger per contract
 * persisted cursor
 * poll/send counters, including automatic floor rewinds (`cursorRewinds`)
@@ -144,6 +145,8 @@ The Stellar chain remains the authoritative record.
 * The process reports a cursor-loading problem.
 * `/status` reports `Cursors rewound to the retained floor: N`, or `status.json`
   / `GET /health` show a non-null `rewindFromLedger`, after a long outage.
+* `GET /health` returns `503` and a target has `cursorStale: true`, even if the
+  other watched contract is scanning successfully.
 
 ### Recovery
 
@@ -279,6 +282,40 @@ When investigating:
 
 Do not modify on-chain state or attempt to repair an event by writing to the Mimir contracts.
 
+## Configuration looks applied but is not
+
+### Symptoms
+
+* Telegram answers `401 Unauthorized` for a token that is set in `.env`.
+* Notifications arrive in a chat nobody configured, or in none at all.
+* A value edited in `.env` has no effect after a restart.
+
+### Recovery
+
+Ask the running process where its configuration came from. The report contains
+key names and origins only — never a value — so it is safe to attach to a ticket:
+
+```bash
+curl -s http://127.0.0.1:8787/health | jq .config
+```
+
+* `envFile.present: false` — the process never found `.env`. The file resolves
+  against the working directory, so a supervisor that starts the bot elsewhere
+  silently runs on defaults; start it from the directory holding the file.
+* `envFile.suppliedKeys: 0` with `present: true` — the file was read but supplied
+  none of the known settings. Check for a typo'd key name.
+* `entries[].source: "profile-default"` for `BOT_TOKEN` — `MIMIR_PROFILE=mock` is
+  active and placeholder credentials are in use.
+* `emptyDeclaration: true` — the variable is declared with no value, so a profile
+  or built-in default wins. This is the most common "I set it and nothing
+  changed".
+* `source: "process-env"` where a file value was expected — a variable already
+  set by the platform, systemd, or the shell wins over `.env`; the file is never
+  allowed to overwrite it.
+
+Fix the source, not the symptom: restart only once the report names the source
+you intended for that setting.
+
 ## Safe rollback
 
 For a deployment containing only documentation or operational changes:
@@ -309,6 +346,9 @@ After deployment:
 
 * Confirm the process starts successfully.
 * Run `/status`.
+* Confirm the `[boot] config` line (or `/health` `.config`) shows the sources you
+  intended — for a deployment with a `.env`, `envFile.present: true` and the
+  bot token's source reported as `env-file`, not `profile-default`.
 * Confirm the expected contract IDs and cursor are shown.
 * Confirm the last event ledger advances after new events.
 * Monitor RPC and Telegram errors.
@@ -322,6 +362,11 @@ Never log:
 * payment proofs
 * unrestricted remote API responses
 * sensitive authentication data
+
+Configuration provenance reports are the exception that proves the rule: the
+boot `[boot] config` line and the `/health` `config` section name settings and
+their sources, so they can be shared verbatim. They are built so that a value —
+token, chat id, or otherwise — cannot appear in them.
 
 When reporting an incident, include only the minimum information needed to identify the failure, such as contract, ledger, cursor state, error category, and timestamp.
 

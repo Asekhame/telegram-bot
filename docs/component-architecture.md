@@ -157,9 +157,15 @@ Local HTTP endpoint for process supervisors and deploy checks. Bound to loopback
 - `poller.chainClockAt`: newest observed chain close time (ISO 8601), or `null`
 - `poller.chainClockSkewMs`: `checkedAt - chainClockAt` in milliseconds; positive while the bot is ahead of the chain, `null` before the first observation
 
+**Configuration provenance:**
+- `config`: each setting's name and the source that supplied it (`process-env`, `env-file`, `profile-default`, `built-in-default`, `derived`, `unset`), plus per-source counts and actionable warnings
+- Values are never included, secret or not, so the section is safe to publish; `secret: true` marks which settings are sensitive
+- The boot log prints the same report as one line (`formatProvenanceSummary`)
+
 **Safety:**
 - JSON-only responses
 - No bot tokens, private keys, or unbounded payloads
+- No configuration values of any kind, only names and origins
 - Client errors logged and ignored
 
 ### RPC Client (`src/stellar/client.ts`)

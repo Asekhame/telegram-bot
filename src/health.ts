@@ -3,13 +3,15 @@
  *
  * Bound to loopback by default so it is never an accidental public surface.
  * Responses are JSON-only operational status: no bot tokens, private keys,
- * chat ids, or raw remote payloads.
+ * chat ids, or raw remote payloads. The `config` section names each setting and
+ * the source that supplied it — the one thing about configuration that is safe
+ * to publish is where it came from.
  */
 
 import http from "node:http";
 import type { AddressInfo } from "node:net";
 
-import { networkLabel, type BotConfig } from "./config.js";
+import { configProvenance, networkLabel, type BotConfig, type ConfigProvenance } from "./config.js";
 import type { PollerStatus } from "./poller.js";
 
 export interface HealthDeps {
@@ -17,6 +19,11 @@ export interface HealthDeps {
   status: () => PollerStatus;
   /** Optional clock for deterministic tests. */
   now?: () => number;
+  /**
+   * Optional provenance reader for deterministic tests. Defaults to
+   * {@link configProvenance}; either way only key names and origins are served.
+   */
+  provenance?: () => ConfigProvenance;
 }
 
 export interface HealthServer {
@@ -81,9 +88,18 @@ export interface HealthReport {
       cursorPreview: string | null;
       /** Ledger a target is resuming from after a floor rewind, or null. */
       rewindFromLedger: number | null;
+      /** RPC rejected this target's cursor as stale; true until a scan succeeds. */
+      cursorStale: boolean;
       hasError: boolean;
     }>;
   };
+  /**
+   * Where configuration came from: each setting's name and the source that
+   * supplied it. No value — secret or not — is ever included, so an operator
+   * can confirm *which* token and chat id this process is using without either
+   * of them leaving the process.
+   */
+  config: ConfigProvenance;
 }
 
 const CURSOR_PREVIEW_LEN = 24;
@@ -143,6 +159,7 @@ export function buildHealthReport(
   config: BotConfig,
   poller: PollerStatus,
   nowMs: number = Date.now(),
+  provenance: ConfigProvenance = configProvenance(),
 ): HealthReport {
   const uptimeMs = poller.startedAt > 0 ? Math.max(0, nowMs - poller.startedAt) : 0;
   // Tolerate a status snapshot that never learned about the chain clock (and
@@ -166,12 +183,13 @@ export function buildHealthReport(
   } else {
     const failureBudget = Math.max(3, Math.ceil(60_000 / Math.max(config.pollIntervalMs, 1)));
     const tooManyFailures = poller.consecutiveFailures >= failureBudget;
+    const hasStaleCursor = poller.targets.some((target) => target.cursorStale === true);
     const hasEverSucceeded = poller.lastSuccessAt !== null;
     const stale =
       hasEverSucceeded &&
       config.healthStaleMs > 0 &&
       nowMs - (poller.lastSuccessAt as number) > config.healthStaleMs;
-    status = tooManyFailures || stale ? "degraded" : "ok";
+    status = tooManyFailures || stale || hasStaleCursor ? "degraded" : "ok";
   }
 
   return {
@@ -211,9 +229,11 @@ export function buildHealthReport(
         lastEventLedger: t.lastEventLedger,
         cursorPreview: previewCursor(t.cursor),
         rewindFromLedger: typeof t.rewindFromLedger === "number" ? t.rewindFromLedger : null,
+        cursorStale: t.cursorStale === true,
         hasError: t.lastError !== null,
       })),
     },
+    config: provenance,
   };
 }
 
@@ -240,6 +260,7 @@ function sendJson(
 export function startHealthServer(deps: HealthDeps): HealthServer {
   const { config, status } = deps;
   const now = deps.now ?? Date.now;
+  const provenance = deps.provenance ?? configProvenance;
 
   if (config.healthPort === 0) {
     console.log("[health] disabled (HEALTH_PORT=0)");
@@ -251,7 +272,7 @@ export function startHealthServer(deps: HealthDeps): HealthServer {
     const url = new URL(req.url ?? "/", `http://${config.healthHost}`);
 
     if (method === "GET" && (url.pathname === "/health" || url.pathname === "/healthz")) {
-      const report = buildHealthReport(config, status(), now());
+      const report = buildHealthReport(config, status(), now(), provenance());
       sendJson(res, report.ok ? 200 : 503, report);
       return;
     }
